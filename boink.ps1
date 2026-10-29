@@ -226,16 +226,18 @@ function Get-SchedulerStatus {
 function Install-Schtasks {
   $interval = Get-Interval
   $taskName = 'Boink'
+  # Task Scheduler rejects repetition intervals below one minute (PT1M); clamp.
+  $repSeconds = [Math]::Max($interval, 60)
   $arg = '-NoProfile -ExecutionPolicy Bypass -File "{0}" --dir "{1}" tick' -f $script:Self, $script:StateDir
   $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
-  $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5) -RepetitionInterval (New-TimeSpan -Seconds $interval) -RepetitionDuration (New-TimeSpan -Days 3650)
+  $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5) -RepetitionInterval (New-TimeSpan -Seconds $repSeconds) -RepetitionDuration (New-TimeSpan -Days 3650)
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
   # S4U runs for the current user without a password and without needing an
   # interactive logon session — the common case on headless CI runners.
   $principal = New-ScheduledTaskPrincipal -UserId ('{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME) -LogonType S4U -RunLevel Limited
   Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
   Start-ScheduledTask -TaskName $taskName | Out-Null
-  'schtasks installed ''{0}'' (every {1}s)' -f $taskName, $interval
+  'schtasks installed ''{0}'' (every {1}s)' -f $taskName, $repSeconds
 }
 
 # ---- dispatch ----------------------------------------------------------------
