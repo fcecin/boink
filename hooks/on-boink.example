@@ -1,0 +1,8 @@
+#!/bin/sh
+# Example BOINK hook (POSIX). Runs on every BOINK event with the following
+# variables in the environment: BOINK_SEQ, BOINK_TS, BOINK_MONITORS.
+#
+# This is where you inject the BOINK prompt into YOUR harness. A bare-bones
+# default just echoes to wherever the scheduler logs; point it at a FIFO, a
+# socket, a watched file, or the harness's own notification channel.
+printf 'BOINK %s (monitors=%s)\n' "$BOINK_SEQ" "$BOINK_MONITORS"

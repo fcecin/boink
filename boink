@@ -1,0 +1,411 @@
+#!/bin/sh
+# boink — a wall-clock watchdog that keeps your monitors honest, outside Claude.
+#
+# Harness-agnostic replacement for the Claude Code `CronCreate("BOINK")` pattern.
+# Any agent harness that can run a shell command can use it: you register the
+# things you are waiting on, the OS scheduler (or the built-in daemon) fires
+# `boink tick` on wall-clock time, and a BOINK event is emitted to a log + any
+# hooks you install — so a broken monitor cannot starve you of silence.
+#
+# License: Unlicense (public domain). See UNLICENSE.
+set -eu
+
+BOINK_VERSION=0.1.0
+
+# ---- resolve the absolute path to this script -------------------------------
+resolve_self() {
+  _s="$(command -v "$0" 2>/dev/null || printf '%s' "$0")"
+  case "$_s" in
+    /*) printf '%s' "$_s" ;;
+    */*) printf '%s/%s' "$(cd "$(dirname "$_s")" && pwd -P)" "$(basename "$_s")" ;;
+    *)   printf '%s' "$_s" ;;
+  esac
+}
+SELF="$(resolve_self)"
+
+# ---- state directory and defaults -------------------------------------------
+BOINK_DIR="${BOINK_DIR:-$HOME/.boink}"
+BOINK_INTERVAL="${BOINK_INTERVAL:-300}"
+BOINK_SCHEDULER="${BOINK_SCHEDULER:-}"      # 'none' skips scheduler management
+BOINK_BACKEND="${BOINK_BACKEND:-}"          # force cron|launchd|schtasks|daemon
+
+# ---- global option pre-scan --------------------------------------------------
+# `--dir PATH` / `--dir=PATH` may appear before OR after the command (the OS
+# schedulers invoke `boink tick --dir DIR`).  Pull them out of the whole
+# argument list, preserving every other argument verbatim, then re-split.
+shell_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\"'\"'/g")"
+}
+
+newargs=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dir) BOINK_DIR="${2:?--dir needs a path}"; shift 2 ;;
+    --dir=*) BOINK_DIR="${1#--dir=}"; shift ;;
+    *) newargs="$newargs $(shell_quote "$1")"; shift ;;
+  esac
+done
+[ -z "$newargs" ] || eval "set -- $newargs"
+
+cmd="${1:-help}"
+[ "$#" -eq 0 ] || shift
+
+mkdir -p "$BOINK_DIR"
+touch "$BOINK_DIR/monitors" "$BOINK_DIR/boink.log"
+[ -s "$BOINK_DIR/seq" ] || printf '0\n' > "$BOINK_DIR/seq"
+
+# ---- small helpers -----------------------------------------------------------
+die() { printf 'boink: %s\n' "$*" >&2; exit 1; }
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+monitor_count() {
+  c="$(sed -n '$=' "$BOINK_DIR/monitors" 2>/dev/null || true)"
+  printf '%s' "${c:-0}"
+}
+
+state_interval() {
+  n="$BOINK_INTERVAL"
+  if [ -f "$BOINK_DIR/interval" ]; then
+    n="$(cat "$BOINK_DIR/interval")"
+  fi
+  case "$n" in ''|*[!0-9]*) n=300;; esac
+  [ "$n" -ge 1 ] || n=300
+  printf '%s' "$n"
+}
+
+xml_escape() {
+  sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+      -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
+}
+
+backend() {
+  if [ -n "$BOINK_BACKEND" ]; then printf '%s' "$BOINK_BACKEND"; return; fi
+  case "$(uname -s)" in
+    Darwin)
+      if command -v launchctl >/dev/null 2>&1; then printf 'launchd'; else printf 'cron'; fi ;;
+    *)
+      if command -v crontab >/dev/null 2>&1; then printf 'cron'; else printf 'daemon'; fi ;;
+  esac
+}
+
+# ---- command implementations -------------------------------------------------
+
+cmd_arm() {
+  tag=""; interval=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --tag) tag="${2:?--tag needs a name}"; shift 2 ;;
+      --tag=*) tag="${1#--tag=}"; shift ;;
+      --interval) interval="${2:?--interval needs seconds}"; shift 2 ;;
+      --interval=*) interval="${1#--interval=}"; shift ;;
+      *) tag="$1"; shift ;;
+    esac
+  done
+  [ -n "$tag" ] || tag="session-$(now_iso)"
+  if grep -qxF "$tag" "$BOINK_DIR/monitors"; then
+    printf '%-8s %s (already live)\n' armed "$tag"
+  else
+    printf '%s\n' "$tag" >> "$BOINK_DIR/monitors"
+    printf '%-8s %s\n' armed "$tag"
+  fi
+  if [ -n "$interval" ]; then printf '%s\n' "$interval" > "$BOINK_DIR/interval"; fi
+  scheduler_install
+}
+
+cmd_disarm() {
+  if [ "$#" -gt 0 ] && [ "$1" = "--all" ]; then
+    : > "$BOINK_DIR/monitors"
+    printf '%-8s all\n' disarmed
+    return 0
+  fi
+  if [ "$#" -eq 0 ]; then die "disarm needs a tag or --all"; fi
+  for t in "$@"; do
+    if grep -qxF "$t" "$BOINK_DIR/monitors"; then
+      grep -vxF "$t" "$BOINK_DIR/monitors" > "$BOINK_DIR/monitors.tmp" || true
+      mv "$BOINK_DIR/monitors.tmp" "$BOINK_DIR/monitors"
+      printf '%-8s %s\n' disarmed "$t"
+    else
+      printf '%-8s %s (not live)\n' not-live "$t"
+    fi
+  done
+}
+
+cmd_sweep() {
+  printf 'live monitors: %s\n' "$(monitor_count)"
+  if [ -s "$BOINK_DIR/monitors" ]; then sed 's/^/  - /' "$BOINK_DIR/monitors"; fi
+  printf 'reap a finished monitor: boink disarm <tag>   (or boink disarm --all)\n'
+}
+
+cmd_off() {
+  : > "$BOINK_DIR/monitors"
+  scheduler_remove
+  printf '%-8s no live monitors; scheduler removed\n' off
+}
+
+cmd_tick() {
+  count="$(monitor_count)"
+  count=${count:-0}
+  if [ "$count" -eq 0 ]; then
+    printf 'tick: no live monitors\n' >&2
+    return 0
+  fi
+  seq="$(cat "$BOINK_DIR/seq")"; seq=$((seq + 1))
+  printf '%s\n' "$seq" > "$BOINK_DIR/seq"
+  ts="$(now_iso)"
+  printf 'BOINK seq=%s ts=%s monitors=%s\n' "$seq" "$ts" "$count" >> "$BOINK_DIR/boink.log"
+  printf 'seq=%s ts=%s monitors=%s\n' "$seq" "$ts" "$count" > "$BOINK_DIR/last"
+  run_hooks "$seq" "$ts" "$count"
+}
+
+run_hooks() {
+  _seq=$1 _ts=$2 _count=$3
+  [ -d "$BOINK_DIR/hooks" ] || return 0
+  for h in "$BOINK_DIR"/hooks/*; do
+    [ -e "$h" ] || continue
+    [ -f "$h" ] || continue
+    [ -x "$h" ] || continue
+    BOINK_SEQ="$_seq" BOINK_TS="$_ts" BOINK_MONITORS="$_count" "$h" || true
+  done
+}
+
+cmd_status() {
+  printf 'boink %s\n' "$BOINK_VERSION"
+  printf '  dir:        %s\n' "$BOINK_DIR"
+  printf '  interval:   %ss\n' "$(state_interval)"
+  printf '  monitors:   %s\n' "$(monitor_count)"
+  if [ -s "$BOINK_DIR/monitors" ]; then sed 's/^/    - /' "$BOINK_DIR/monitors"; fi
+  if [ -s "$BOINK_DIR/last" ]; then
+    printf '  last:       %s\n' "$(cat "$BOINK_DIR/last")"
+  else
+    printf '  last:       never\n'
+  fi
+  printf '  scheduler:  %s\n' "$(scheduler_status)"
+  if [ -s "$BOINK_DIR/boink.log" ]; then
+    printf '  log tail:\n'
+    tail -n 5 "$BOINK_DIR/boink.log" | sed 's/^/    /'
+  fi
+}
+
+cmd_daemon() {
+  interval="$(state_interval)"
+  printf 'boink daemon: ticking every %ss (ctrl-c to stop)\n' "$interval"
+  while :; do
+    "$SELF" tick --dir "$BOINK_DIR" >/dev/null 2>&1 || true
+    sleep "$interval" || break
+  done
+}
+
+cmd_watch() {
+  if tail -n 0 -F "$BOINK_DIR/boink.log" 2>/dev/null; then :; else
+    tail -n 0 -f "$BOINK_DIR/boink.log"
+  fi
+}
+
+cmd_log() { tail -n "${BOINK_TAIL:-50}" "$BOINK_DIR/boink.log" 2>/dev/null || true; }
+
+# ---- scheduler backends ------------------------------------------------------
+
+cron_spec() {
+  n="$1"
+  case "$n" in ''|*[!0-9]*) n=300;; esac
+  if [ "$n" -le 60 ]; then
+    printf '*'
+  elif [ "$n" -eq 300 ]; then
+    printf '2-59/5'
+  else
+    m=$((n / 60)); [ "$m" -lt 1 ] && m=1; [ "$m" -gt 59 ] && m=59
+    printf '*/%s' "$m"
+  fi
+}
+
+cron_block() {
+  spec="$1"
+  printf '# boink:begin — managed by boink; do not edit\n'
+  printf '%s * * * * /bin/sh "%s" tick --dir "%s" >> "%s" 2>&1\n' \
+    "$spec" "$SELF" "$BOINK_DIR" "$BOINK_DIR/cron.log"
+  printf '# boink:end\n'
+}
+
+scheduler_cron_install() {
+  spec="$(cron_spec "$(state_interval)")"
+  if crontab -l 2>/dev/null | grep -qF 'boink:begin'; then
+    printf '%-8s already installed (%s)\n' cron "$spec"
+    return 0
+  fi
+  { crontab -l 2>/dev/null || true; cron_block "$spec"; } | crontab -
+  printf '%-8s installed (schedule: %s * * * *)\n' cron "$spec"
+}
+
+scheduler_cron_remove() {
+  if crontab -l 2>/dev/null | grep -qF 'boink:begin'; then
+    t="$(mktemp)"
+    crontab -l 2>/dev/null | awk '/boink:begin/{i=1;next} /boink:end/{i=0;next} i{next} {print}' > "$t"
+    if [ -s "$t" ]; then crontab "$t"; else crontab -r 2>/dev/null || true; fi
+    rm -f "$t"
+    printf '%-8s removed\n' cron
+  else
+    printf '%-8s not installed\n' cron
+  fi
+}
+
+scheduler_cron_status() {
+  if crontab -l 2>/dev/null | grep -qF 'boink:begin'; then
+    printf 'cron (installed)'
+  else
+    printf 'cron (not installed)'
+  fi
+}
+
+launchd_label() { printf 'com.fcecin.boink'; }
+launchd_uid() { if [ -n "${UID:-}" ]; then printf '%s' "$UID"; else id -u; fi; }
+launchd_plist() { printf '%s/Library/LaunchAgents/%s.plist' "$HOME" "$(launchd_label)"; }
+
+scheduler_launchd_install() {
+  interval="$(state_interval)"
+  label="$(launchd_label)"
+  plist="$(launchd_plist)"
+  mkdir -p "$HOME/Library/LaunchAgents"
+  self_x="$(printf '%s' "$SELF" | xml_escape)"
+  dir_x="$(printf '%s' "$BOINK_DIR" | xml_escape)"
+  log_x="$(printf '%s/launchd.log' "$BOINK_DIR" | xml_escape)"
+  err_x="$(printf '%s/launchd.err' "$BOINK_DIR" | xml_escape)"
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>$self_x</string>
+    <string>tick</string>
+    <string>--dir</string><string>$dir_x</string>
+  </array>
+  <key>StartInterval</key><integer>$interval</integer>
+  <key>StandardOutPath</key><string>$log_x</string>
+  <key>StandardErrorPath</key><string>$err_x</string>
+</dict></plist>
+EOF
+  if launchctl bootstrap "gui/$(launchd_uid)" "$plist" 2>/dev/null; then
+    printf '%-8s bootstrapped (every %ss)\n' launchd "$interval"
+  elif launchctl load -w "$plist" 2>/dev/null; then
+    printf '%-8s loaded (every %ss)\n' launchd "$interval"
+  else
+    printf '%-8s wrote %s but load failed\n' launchd "$plist" >&2
+  fi
+}
+
+scheduler_launchd_remove() {
+  plist="$(launchd_plist)"
+  launchctl bootout "gui/$(launchd_uid)/$(launchd_label)" 2>/dev/null || \
+    launchctl unload "$plist" 2>/dev/null || true
+  rm -f "$plist"
+  printf '%-8s removed\n' launchd
+}
+
+scheduler_launchd_status() {
+  if launchctl list 2>/dev/null | grep -qF "$(launchd_label)"; then
+    printf 'launchd (loaded)'
+  else
+    printf 'launchd (not loaded)'
+  fi
+}
+
+scheduler_daemon_install() {
+  printf '%-8s no persistent scheduler here; run: boink daemon &\n' daemon
+}
+
+scheduler_daemon_remove() { printf '%-8s stop the background boink daemon process\n' daemon; }
+scheduler_daemon_status() { printf 'daemon (manual)'; }
+
+scheduler_install() {
+  if [ "$BOINK_SCHEDULER" = "none" ]; then
+    printf '%-8s skipped (BOINK_SCHEDULER=none)\n' scheduler
+    return 0
+  fi
+  case "$(backend)" in
+    cron)    scheduler_cron_install ;;
+    launchd) scheduler_launchd_install ;;
+    daemon)  scheduler_daemon_install ;;
+    *)       printf '%-8s unknown backend: %s\n' scheduler "$(backend)" >&2; return 1 ;;
+  esac
+}
+
+scheduler_remove() {
+  if [ "$BOINK_SCHEDULER" = "none" ]; then
+    printf '%-8s skipped (BOINK_SCHEDULER=none)\n' scheduler
+    return 0
+  fi
+  case "$(backend)" in
+    cron)    scheduler_cron_remove ;;
+    launchd) scheduler_launchd_remove ;;
+    daemon)  scheduler_daemon_remove ;;
+  esac
+}
+
+scheduler_status() {
+  case "$(backend)" in
+    cron)    scheduler_cron_status ;;
+    launchd) scheduler_launchd_status ;;
+    daemon)  scheduler_daemon_status ;;
+    *)       printf 'unknown (%s)' "$(backend)" ;;
+  esac
+}
+
+cmd_scheduler() {
+  a="${1:-status}"; [ "$#" -gt 0 ] && shift || true
+  case "$a" in
+    install) scheduler_install "$@" ;;
+    remove|uninstall) scheduler_remove ;;
+    status) scheduler_status; printf '\n' ;;
+    backend) backend; printf '\n' ;;
+    *) die "scheduler: unknown action '$a' (install|remove|status|backend)" ;;
+  esac
+}
+
+# ---- dispatch ----------------------------------------------------------------
+case "$cmd" in
+  arm)                    cmd_arm "$@" ;;
+  disarm|rm)              cmd_disarm "$@" ;;
+  sweep)                  cmd_sweep ;;
+  status)                 cmd_status ;;
+  tick)                   cmd_tick ;;
+  off|stop)               cmd_off ;;
+  daemon)                 cmd_daemon ;;
+  watch)                  cmd_watch ;;
+  log)                    cmd_log ;;
+  scheduler)              cmd_scheduler "$@" ;;
+  version|--version)      printf 'boink %s\n' "$BOINK_VERSION" ;;
+  help|-h|--help|'')      cat <<EOF
+boink — a wall-clock watchdog that keeps your monitors honest, outside Claude.
+
+Harness-agnostic replacement for Claude Code's CronCreate("BOINK") pattern.
+Any agent that can run a shell command can arm it; the OS scheduler (or the
+built-in daemon) fires `boink tick` on wall-clock time, emitting a BOINK event
+to a log + hooks, so a broken monitor can't starve you of silence.
+EOF
+    cat <<EOF
+usage: boink <command> [options]
+
+commands:
+  arm [--tag NAME] [--interval SECS]   register a live monitor, arm the scheduler
+  disarm TAG... | --all                reap finished monitors
+  sweep                                list live monitors (never auto-reaps)
+  status                               show state + scheduler + log tail
+  tick                                 emit a BOINK event if monitors are live
+  off                                  disarm all + remove the scheduler
+  daemon                               foreground self-loop scheduler (fallback)
+  watch                                tail the BOINK event log
+  log                                  show the BOINK event log
+  scheduler install|remove|status|backend
+  version                              print version
+
+env:
+  BOINK_DIR        state dir (default ~/.boink)
+  BOINK_INTERVAL   default interval seconds (default 300)
+  BOINK_SCHEDULER  'none' disables scheduler management (tests)
+  BOINK_BACKEND    force cron|launchd|daemon
+EOF
+    ;;
+  *) die "unknown command: $cmd (try: boink help)" ;;
+esac
