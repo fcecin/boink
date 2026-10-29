@@ -52,6 +52,9 @@ function Get-MonitorCount {
   $c = Get-Content -LiteralPath $monFile -ErrorAction SilentlyContinue | Where-Object { $_ -ne '' }
   return @($c).Count
 }
+function Set-Monitors([string[]]$items) {
+  [System.IO.File]::WriteAllLines($monFile, $items)
+}
 function Get-Interval {
   if (Test-Path -LiteralPath (Join-Path $script:StateDir 'interval')) {
     $v = (Get-Content -LiteralPath (Join-Path $script:StateDir 'interval') -Raw).Trim()
@@ -94,7 +97,7 @@ function Invoke-Arm {
 
 function Invoke-Disarm {
   if ($CommandArgs.Count -gt 0 -and $CommandArgs[0] -eq '--all') {
-    '' | Set-Content -LiteralPath $monFile
+    Set-Monitors @()
     'disarmed all'
     return
   }
@@ -102,7 +105,7 @@ function Invoke-Disarm {
   foreach ($t in $CommandArgs) {
     $lines = @(Get-Content -LiteralPath $monFile -ErrorAction SilentlyContinue | Where-Object { $_ -ne '' })
     if ($lines -contains $t) {
-      ($lines | Where-Object { $_ -ne $t }) | Set-Content -LiteralPath $monFile
+      Set-Monitors ([string[]]@($lines | Where-Object { $_ -ne $t }))
       'disarmed {0}' -f $t
     }
     else {
@@ -118,7 +121,7 @@ function Invoke-Sweep {
 }
 
 function Invoke-Off {
-  '' | Set-Content -LiteralPath $monFile
+  Set-Monitors @()
   Remove-Scheduler
   'off      no live monitors; scheduler removed'
 }
@@ -128,13 +131,14 @@ function Invoke-Hooks([int]$seq, [string]$ts, [int]$count) {
   if (-not (Test-Path -LiteralPath $dir)) { return }
   $env:BOINK_SEQ = "$seq"; $env:BOINK_TS = $ts; $env:BOINK_MONITORS = "$count"
   Get-ChildItem -LiteralPath $dir -File | Sort-Object Name | ForEach-Object {
+    $hfile = $_
     try {
-      switch ($_.Extension.ToLower()) {
-        '.ps1' { & $_.FullName }
-        '.cmd' { & cmd.exe /c ('"{0}"' -f $_.FullName) }
-        '.bat' { & cmd.exe /c ('"{0}"' -f $_.FullName) }
-        '.sh'  { if (Get-Command sh -ErrorAction SilentlyContinue) { & sh $_.FullName } }
-        default { & $_.FullName }
+      switch ($hfile.Extension.ToLower()) {
+        '.ps1' { & $hfile.FullName }
+        '.cmd' { & cmd.exe /c ('"{0}"' -f $hfile.FullName) }
+        '.bat' { & cmd.exe /c ('"{0}"' -f $hfile.FullName) }
+        '.sh'  { if (Get-Command sh -ErrorAction SilentlyContinue) { & sh $hfile.FullName } }
+        default { & $hfile.FullName }
       }
     }
     catch { }
@@ -224,9 +228,12 @@ function Install-Schtasks {
   $taskName = 'Boink'
   $arg = '-NoProfile -ExecutionPolicy Bypass -File "{0}" --dir "{1}" tick' -f $script:Self, $script:StateDir
   $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
-  $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(3) -RepetitionInterval (New-TimeSpan -Seconds $interval) -RepetitionDuration (New-TimeSpan -Days 3650)
-  $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+  $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5) -RepetitionInterval (New-TimeSpan -Seconds $interval) -RepetitionDuration (New-TimeSpan -Days 3650)
+  $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+  # S4U runs for the current user without a password and without needing an
+  # interactive logon session — the common case on headless CI runners.
+  $principal = New-ScheduledTaskPrincipal -UserId ('{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME) -LogonType S4U -RunLevel Limited
+  Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
   Start-ScheduledTask -TaskName $taskName | Out-Null
   'schtasks installed ''{0}'' (every {1}s)' -f $taskName, $interval
 }

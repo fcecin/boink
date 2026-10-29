@@ -100,9 +100,16 @@ $env:BOINK_SCHEDULER = $null
 $s4 = New-State 's4'; $sent4 = Join-Path $TMP 'sent4'
 Install-Hook $s4 $sent4
 try {
-  Run-Boink $s4 @('arm','--tag','schtasks-fire','--interval','10') | Out-Null
+  '--- schtasks arm output ---'
+  Run-Boink $s4 @('arm','--tag','schtasks-fire','--interval','10')
+  '--- task state after arm ---'
+  Get-ScheduledTask -TaskName 'Boink' -ErrorAction SilentlyContinue | Select-Object TaskName,State,LastRunTime,LastTaskResult | Format-List | Out-String | Write-Output
   'ok   waiting 30s for real Task Scheduler to fire...'
   Start-Sleep -Seconds 30
+  '--- task state after wait ---'
+  Get-ScheduledTask -TaskName 'Boink' -ErrorAction SilentlyContinue | Select-Object TaskName,State,LastRunTime,LastTaskResult | Format-List | Out-String | Write-Output
+  '--- boink.log ---'
+  if (Test-Path (Join-Path $s4 'boink.log')) { Get-Content -LiteralPath (Join-Path $s4 'boink.log') | ForEach-Object { "  $_" } }
   $n4 = Count-Boinks (Join-Path $s4 'boink.log')
   if ($n4 -ge 1) { ok "real Task Scheduler fired a BOINK (got $n4)" } else { bad "real Task Scheduler fired a BOINK (got $n4)" }
   if ((Count-Lines $sent4) -ge 1) { ok 'real Task Scheduler hook delivered' } else { bad 'real Task Scheduler hook delivered (sentinel empty)' }
